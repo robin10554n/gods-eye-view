@@ -1572,6 +1572,7 @@ Historical planning documents may not match runtime behavior.
 
 ## Runtime Stack
 
+- Globe pointer controls (`src/cameraControls.js`): scroll-wheel zoom, left-drag orbit, right-drag tilt, left+right-drag look-in-place. Middle-button / scroll-wheel click is not bound. Pinch remains on zoom and tilt for trackpads and touch.
 - Vite + CesiumJS app with Google Photorealistic 3D Tiles
 - Scene/HUD/style systems in `src/ui.js` and `src/hud.js`
 - Layer management in `src/data/manager.js`

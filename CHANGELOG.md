@@ -5,6 +5,11 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ## [Unreleased]
 
+### Changed
+
+- Globe pointer controls no longer use the middle mouse button. Scroll zooms;
+  left-drag orbits; right-drag tilts; holding both buttons looks in place.
+
 ### Fixed
 
 - Pinokio now recognizes its nested successful-install marker, so a completed
