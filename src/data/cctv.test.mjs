@@ -37,6 +37,8 @@ import cctvLayer, {
   deactivateActiveCamera,
   CCTV_FOCUS_RESULT,
   FRUSTUM_GROUND_CLEARANCE_M,
+  MONITOR_PLANE_RENDER_STATE,
+  monitorPlaneModelMatrix,
   CCTV_CALIBRATION_STORAGE_KEY_V2,
   CCTV_CALIBRATION_STORAGE_KEY_V1,
   readCalibrationStoreV2,
@@ -557,6 +559,7 @@ test('real active monitor plane owns one protected host label and no native labe
     assert.equal(entry.protected, true);
     assert.equal(entry.paintLane, 'selected');
     assert.equal(runtime.planeEntity.show, true);
+    assert.equal(runtime.planePrimitive, null, 'unit tests have no scene primitives');
 
     const cachedPosition = runtime.labelPosition;
     record.frustumPositions.label = Cesium.Cartesian3.add(
@@ -585,6 +588,81 @@ test('real active monitor plane owns one protected host label and no native labe
       ['clear', 'cctv-projection'],
       ['visible', 'cctv-projection', false],
     ]);
+  } finally {
+    _setCctvCoverageStateForTest({ enabled: false });
+    _setCctvOverlayHostForTest();
+  }
+});
+
+test('focused monitor plane fill does not depth-test against the city', () => {
+  assert.equal(MONITOR_PLANE_RENDER_STATE.depthTest.enabled, false);
+  assert.equal(MONITOR_PLANE_RENDER_STATE.depthMask, false);
+  const src = fs.readFileSync(fileURLToPath(new URL('./cctv.js', import.meta.url)), 'utf8');
+  assert.match(src, /depthTest: \{ enabled: MONITOR_PLANE_RENDER_STATE\.depthTest\.enabled \}/);
+  assert.match(src, /runtime\.planeEntity\.plane\.fill = false/);
+});
+
+test('monitor plane model matrix sits the unit quad on the frustum cap', () => {
+  const position = Cesium.Cartesian3.fromDegrees(-97.7431, 30.2672, 120);
+  const orientation = Cesium.Quaternion.IDENTITY;
+  const matrix = monitorPlaneModelMatrix(position, orientation, 40, 22.5);
+  const origin = Cesium.Matrix4.multiplyByPoint(matrix, Cesium.Cartesian3.ZERO, new Cesium.Cartesian3());
+  assert.ok(Cesium.Cartesian3.equalsEpsilon(origin, position, Cesium.Math.EPSILON7));
+  const right = Cesium.Matrix4.multiplyByPoint(matrix, new Cesium.Cartesian3(0.5, 0, 0), new Cesium.Cartesian3());
+  assert.ok(Math.abs(Cesium.Cartesian3.distance(origin, right) - 20) < 1e-6);
+});
+
+test('focused monitor plane primitive tracks visibility and cap placement', () => {
+  const overlayHost = {
+    setEntries() {},
+    setVisible() {},
+    clearSource() {},
+  };
+  const viewer = { entities: new Cesium.EntityCollection() };
+  const record = {
+    camera: {
+      ...UNCLAMPED_CAMERA,
+      id: 'foreground-plane',
+      name: 'Foreground Monitor',
+      groundElevationM: UNCLAMPED_GROUND,
+    },
+    coverageEntities: [],
+    projection: null,
+  };
+  _setCctvOverlayHostForTest(overlayHost);
+  try {
+    const runtime = _createCctvProjectionPlaneForTest(viewer, record);
+    let matrixWrites = 0;
+    runtime.planePrimitive = {
+      show: false,
+      _modelMatrix: Cesium.Matrix4.IDENTITY,
+      set modelMatrix(value) {
+        this._modelMatrix = value;
+        matrixWrites += 1;
+      },
+      get modelMatrix() {
+        return this._modelMatrix;
+      },
+    };
+    _setCctvCoverageStateForTest({
+      viewer,
+      records: [record],
+      activeCameraId: record.camera.id,
+      enabled: true,
+      coverageMode: 'off',
+      showProjection: true,
+    });
+    refreshCoverageStyles();
+    assert.equal(runtime.planePrimitive.show, true);
+
+    const before = matrixWrites;
+    _updateCctvProjectionPlaneForTest(record);
+    assert.ok(matrixWrites > before, 'pose updates rewrite the depth-test-free fill');
+    assert.ok(runtime.planePrimitive.modelMatrix instanceof Cesium.Matrix4);
+
+    hideCctvRecordVisuals([record], () => {}, record.camera.id);
+    assert.equal(runtime.planeEntity.show, false);
+    assert.equal(runtime.planePrimitive.show, false);
   } finally {
     _setCctvCoverageStateForTest({ enabled: false });
     _setCctvOverlayHostForTest();

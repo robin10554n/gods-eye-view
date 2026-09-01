@@ -15,6 +15,8 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ### Fixed
 
+- The focused CCTV monitor plane draws in front of photoreal tiles, so the
+  live frame stays visible instead of clipping into buildings or the ground.
 - Pinokio now recognizes its nested successful-install marker, so a completed
   one-click install exposes Start instead of returning to Install.
 - The keyless `dev-fresh.sh` startup summary now names Esri World Imagery with

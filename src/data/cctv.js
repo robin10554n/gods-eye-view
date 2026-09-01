@@ -22,7 +22,10 @@
  *   per-frame); image feeds alternate two offscreen canvases so the texture
  *   re-uploads on every repaint tick (<=1Hz). One live plane at a time. When
  *   the catalog has a stills `feedType` plus a `videoFeedType` (TfL JamCam
- *   MP4 clips), only this focused plane plays the clip. On
+ *   MP4 clips), only this focused plane plays the clip. The focused fill is
+ *   drawn without a depth test so photoreal tiles cannot bury it in a
+ *   building or the ground; the frustum wireframe still uses depth-fail
+ *   so the cone reads through the city. On
  *   activation a single scene.pickFromRay obstruction probe (§9.1 — the ONLY
  *   raycast in the subsystem) clamps the plane's range short of the first
  *   tile hit so the end cap never clips into buildings.
@@ -159,6 +162,14 @@ const PROJECTION_VERT_ASPECT = PROJECTION_CANVAS_WIDTH / PROJECTION_CANVAS_HEIGH
 // below groundAlt + this clearance, so a fabricated pitch (-24°) cannot bury
 // the monitor plane in the 3D tiles. Exported for the unit suite.
 export const FRUSTUM_GROUND_CLEARANCE_M = 2;
+/**
+ * Focused monitor-plane fill ignores scene depth so 3D tiles cannot occlude
+ * the live frame. The native entity keeps the outline and pick target.
+ */
+export const MONITOR_PLANE_RENDER_STATE = Object.freeze({
+  depthTest: Object.freeze({ enabled: false }),
+  depthMask: false,
+});
 /** Public result codes for explicit CCTV camera flights. */
 export const CCTV_FOCUS_RESULT = Object.freeze({
   FOCUSED: 'focused',
@@ -1316,6 +1327,24 @@ function planeOrientationFor(camera, capCenterPos) {
 }
 
 /**
+ * Model matrix for a unit XY PlaneGeometry (-0.5..0.5) covering the monitor
+ * dimensions at the frustum cap.
+ *
+ * @param {Cesium.Cartesian3} position Cap center.
+ * @param {Cesium.Quaternion} orientation Plane orientation.
+ * @param {number} widthM Plane width in metres.
+ * @param {number} heightM Plane height in metres.
+ * @returns {Cesium.Matrix4}
+ */
+export function monitorPlaneModelMatrix(position, orientation, widthM, heightM) {
+  return Cesium.Matrix4.fromTranslationQuaternionRotationScale(
+    position,
+    orientation,
+    new Cesium.Cartesian3(widthM, heightM, 1),
+  );
+}
+
+/**
  * Task 5: the surface regime the scene is CURRENTLY rendering, derived live
  * from `globe.show` (mapStackController's `_activatePhotoreal` /
  * `_activateGlobeStack` flip exactly this flag). Reading scene state directly
@@ -1486,7 +1515,7 @@ function refreshProjectionTextures(record) {
   if (!buffer) return;
   runtime.lastTextureSwapAt = now;
   runtime.lastSwappedCanvasStamp = runtime.canvasStamp;
-  runtime.planeMaterial.image = buffer;
+  setMonitorPlaneImage(runtime, buffer);
 }
 
 /**
@@ -1580,6 +1609,7 @@ function updatePlanePlacement(record) {
       geometry.halfH * 2
     );
   }
+  syncMonitorPlanePrimitive(record, runtime, geometry, positions);
   if (runtime.labelPosition) {
     Cesium.Cartesian3.clone(positions.label, runtime.labelPosition);
   }
@@ -1601,7 +1631,9 @@ function clearProjectionOverlay() {
  */
 function setPlaneVisible(runtime, visible) {
   if (!runtime) return;
-  if (runtime.planeEntity) runtime.planeEntity.show = !!visible;
+  const showing = !!visible;
+  if (runtime.planeEntity) runtime.planeEntity.show = showing;
+  if (runtime.planePrimitive) runtime.planePrimitive.show = showing;
   if (visible && runtime.overlayEntry && runtime.cameraId) {
     if (_projectionOverlayOwnerId !== runtime.cameraId) {
       _cctvOverlayHost.setEntries(
@@ -1641,7 +1673,92 @@ function createProjectionPlane(record, runtime, geometry, positions) {
       outlineColor: PLANE_OUTLINE_COLOR,
     },
   });
+  syncMonitorPlanePrimitive(record, runtime, geometry, positions);
   return runtime.planeEntity;
+}
+
+function monitorPlaneImage(runtime) {
+  if (runtime?.video) return runtime.video;
+  return runtime?.canvas || null;
+}
+
+function setMonitorPlaneImage(runtime, image) {
+  if (!runtime || !image) return;
+  if (runtime.planeMaterial) runtime.planeMaterial.image = image;
+  const uniforms = runtime.planePrimitive?.appearance?.material?.uniforms;
+  if (uniforms) uniforms.image = image;
+}
+
+function destroyMonitorPlanePrimitive(runtime) {
+  const primitive = runtime?.planePrimitive;
+  if (!primitive) return;
+  const primitives = _viewer?.scene?.primitives;
+  if (primitives && typeof primitives.remove === 'function') {
+    primitives.remove(primitive);
+  }
+  runtime.planePrimitive = null;
+}
+
+/**
+ * Keep a depth-test-free textured quad welded to the frustum cap. Cesium's
+ * entity PlaneGraphics always depth-tests against 3D tiles, which hides the
+ * focused feed inside buildings; this primitive is the visible fill.
+ *
+ * @param {Object} record
+ * @param {Object} runtime
+ * @param {Object} geometry
+ * @param {Object} positions
+ */
+function syncMonitorPlanePrimitive(record, runtime, geometry, positions) {
+  const orientation = planeOrientationFor(record.camera, positions.capCenter);
+  const matrix = monitorPlaneModelMatrix(
+    positions.capCenter,
+    orientation,
+    geometry.halfW * 2,
+    geometry.halfH * 2,
+  );
+  if (runtime.planePrimitive) {
+    runtime.planePrimitive.modelMatrix = matrix;
+    return;
+  }
+  const image = monitorPlaneImage(runtime);
+  const primitives = _viewer?.scene?.primitives;
+  if (!image || !primitives || typeof primitives.add !== 'function') return;
+  try {
+    const primitive = new Cesium.Primitive({
+      geometryInstances: new Cesium.GeometryInstance({
+        geometry: new Cesium.PlaneGeometry({
+          vertexFormat: Cesium.MaterialAppearance.MaterialSupport.TEXTURED.vertexFormat,
+        }),
+        id: runtime.planeEntity,
+        modelMatrix: Cesium.Matrix4.IDENTITY,
+      }),
+      modelMatrix: matrix,
+      appearance: new Cesium.MaterialAppearance({
+        material: Cesium.Material.fromType('Image', {
+          image,
+          color: Cesium.Color.WHITE.withAlpha(0.95),
+          transparent: true,
+        }),
+        translucent: true,
+        flat: true,
+        faceForward: true,
+        renderState: {
+          depthTest: { enabled: MONITOR_PLANE_RENDER_STATE.depthTest.enabled },
+          depthMask: MONITOR_PLANE_RENDER_STATE.depthMask,
+          blending: Cesium.BlendingState.ALPHA_BLEND,
+          cull: { enabled: false },
+        },
+      }),
+      asynchronous: false,
+      allowPicking: true,
+      show: !!runtime.planeEntity?.show,
+    });
+    runtime.planePrimitive = primitives.add(primitive);
+    if (runtime.planeEntity?.plane) runtime.planeEntity.plane.fill = false;
+  } catch {
+    runtime.planePrimitive = null;
+  }
 }
 
 /**
@@ -1660,6 +1777,7 @@ export function _createCctvProjectionPlaneForTest(viewer, record) {
   const runtime = {
     cameraId: String(record.camera.id),
     planeEntity: null,
+    planePrimitive: null,
     labelPosition: new Cesium.Cartesian3(),
     overlayEntry: null,
     planeMaterial: new Cesium.ColorMaterialProperty(Cesium.Color.WHITE),
@@ -1733,6 +1851,7 @@ function createProjectionRuntime(record) {
     image: null,
     video: null,
     planeEntity: null,
+    planePrimitive: null,
     cameraId: String(record.camera.id),
     labelPosition: new Cesium.Cartesian3(),
     overlayEntry: null,
@@ -1791,10 +1910,10 @@ function createProjectionRuntime(record) {
     runtime.image = img;
   }
 
-  // Monitor plane = the frustum's far cap: video feeds bind the video element
-  // directly (Cesium updates video-backed entity materials per frame); image
-  // feeds start on the placeholder canvas and switch to double-buffer swaps
-  // at <=1Hz.
+  // Monitor plane = the frustum's far cap. The entity keeps outline + picking;
+  // a depth-test-free primitive carries the video/canvas fill so 3D tiles
+  // cannot bury the focused feed. Image feeds swap double-buffer canvases at
+  // <=1Hz; video binds the element directly.
   const geometry = record.frustumGeometry
     || computeFrustumGeometry(record.camera, groundAltFor(record), record.probeClampRangeM);
   const positions = record.frustumPositions || frustumCartesians(geometry);
@@ -1841,6 +1960,7 @@ function destroyProjectionRuntime(runtime) {
     _viewer.entities.remove(runtime.planeEntity);
     runtime.planeEntity = null;
   }
+  destroyMonitorPlanePrimitive(runtime);
   if (_projectionOverlayOwnerId === runtime.cameraId) clearProjectionOverlay();
   runtime.overlayEntry = null;
   runtime.labelPosition = null;
@@ -2194,6 +2314,7 @@ function updateRecordGeometry(record, options = {}) {
     const excludeObjects = [...(record.coverageEntities || [])];
     if (record.billboard) excludeObjects.push(record.billboard);
     if (record.projection?.planeEntity) excludeObjects.push(record.projection.planeEntity);
+    if (record.projection?.planePrimitive) excludeObjects.push(record.projection.planePrimitive);
     sampleMeshFloorCells(_viewer?.scene, [point], {
       excludeObjects: excludeObjects.filter(Boolean),
       viewerLat: viewerCarto ? Cesium.Math.toDegrees(viewerCarto.latitude) : undefined,
@@ -3260,6 +3381,7 @@ export function hideCctvRecordVisuals(records, destroyVolume, activeCameraId = n
     for (const entity of record?.coverageEntities || []) entity.show = false;
     if (record?.viewshedPrimitive) destroyVolume?.(record);
     if (record?.projection?.planeEntity) record.projection.planeEntity.show = false;
+    if (record?.projection?.planePrimitive) record.projection.planePrimitive.show = false;
   }
 }
 
@@ -3674,6 +3796,7 @@ function runActivationObstructionProbe(record) {
     const exclude = [_billboards, ..._coverageEntities];
     for (const runtime of _projectionEntities) {
       if (runtime?.planeEntity) exclude.push(runtime.planeEntity);
+      if (runtime?.planePrimitive) exclude.push(runtime.planePrimitive);
     }
     const hit = scene.pickFromRay(new Cesium.Ray(mountPos, dir), exclude);
     if (!hit?.position) return;
