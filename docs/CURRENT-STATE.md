@@ -1949,7 +1949,10 @@ silently demoting every later lookup for the session.
   default 36 → 250, hard bound 300), filtered to `camera_status === TURNED_ON` (~815 live of
   1,003 rows). City packs (2026-07-04): Caltrans (districts 4/7/11/3 — SF, LA, San Diego,
   Sacramento; cap 300) and TfL London JamCams (cap 250) join Austin (cap 250) as keyless default
-  sources — ~800 cameras total, all RAW PRIOR poses, stills-first.
+  sources — ~800 cameras total, all RAW PRIOR poses. Ambient cards are stills.
+  The focused monitor plane plays TfL's official looping MP4 clip when present;
+  Austin and Caltrans publish JPEGs only, so those focused planes stay on the
+  10-second still refresh.
 - **CCTV v3 UX — viewshed + calibration gizmo** (built 2026-07-05 and field
   validated 2026-07-21): the COVERAGE toggle is a
   tri-state cycle `OFF → ON → VIEWSHED`; viewshed mode renders each visible camera's frustum

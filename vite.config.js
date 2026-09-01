@@ -3489,6 +3489,71 @@ const CALTRANS_ANCHORS = [
 const TFL_JAMCAM_URL = 'https://api.tfl.gov.uk/Place/Type/JamCam';
 const TFL_IMAGE_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
 const DEFAULT_TFL_MAX_SOURCES = 250;
+
+/**
+ * Accept a TfL JamCam video URL only when it is an https MP4 on the official
+ * bucket. Ambient cards keep the JPEG; the focused monitor plane can play this.
+ *
+ * @param {string} videoUrl
+ * @param {string} [origin=TFL_IMAGE_ORIGIN]
+ * @returns {string} Official MP4 URL, or empty string.
+ */
+export function officialTflVideoUrl(videoUrl, origin = TFL_IMAGE_ORIGIN) {
+  const url = String(videoUrl || '').trim();
+  if (!origin || !url.startsWith(origin)) return '';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return '';
+    if (!parsed.pathname.toLowerCase().endsWith('.mp4')) return '';
+  } catch {
+    return '';
+  }
+  return url;
+}
+
+/**
+ * Upstream URL the focused camera's media proxy may fetch. Video URL wins
+ * when present; otherwise a catalog marked as video may use `url`.
+ *
+ * @param {object|null|undefined} source
+ * @returns {string}
+ */
+export function registeredFocusMediaUrl(source) {
+  const videoUrl = typeof source?.videoUrl === 'string' ? source.videoUrl.trim() : '';
+  if (/^https?:\/\//i.test(videoUrl)) return videoUrl;
+  const feedType = normalizeFeedType(source?.feedType);
+  const url = typeof source?.url === 'string' ? source.url.trim() : '';
+  if (isVideoFeedType(feedType) && /^https?:\/\//i.test(url)) return url;
+  return '';
+}
+
+function inferVideoFeedTypeFromUrl(videoUrl) {
+  const url = String(videoUrl || '').trim();
+  if (!url) return '';
+  try {
+    const pathName = new URL(url).pathname.toLowerCase();
+    if (pathName.endsWith('.mp4')) return 'mp4';
+    if (pathName.endsWith('.webm')) return 'webm';
+    if (pathName.endsWith('.m3u8')) return 'hls';
+  } catch {
+    return '';
+  }
+  return '';
+}
+
+/**
+ * Feed type for the focused monitor plane.
+ *
+ * @param {object|null|undefined} source
+ * @returns {string}
+ */
+export function registeredFocusFeedType(source) {
+  const videoType = normalizeFeedType(source?.videoFeedType);
+  if (isVideoFeedType(videoType)) return videoType;
+  const feedType = normalizeFeedType(source?.feedType);
+  return isVideoFeedType(feedType) ? feedType : 'image';
+}
+
 const LONDON_CENTER = { lat: 51.5074, lon: -0.1278 };
 /** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL) infrequent. Frames are fetched per-request and are unaffected. */
 const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
@@ -4044,7 +4109,9 @@ async function loadCaltransSourcesFromOpenData() {
  * list-endpoint rate limit (frames come from TfL's public S3 bucket, which is not
  * rate-limited); the 15-min source cache keeps list hits far below anonymous
  * limits anyway. Only `available === "true"` cameras with finite coords and an
- * image URL on the official bucket are kept. Attribution: "Powered by TfL Open
+ * image URL on the official bucket are kept. Ambient cards use the JPEG; the
+ * focused monitor plane can play the official MP4 clip when TfL publishes one.
+ * Attribution: "Powered by TfL Open
  * Data" (registered in src/data/dataCredits.js).
  *
  * @returns {Promise<Array<object>>} Normalized camera source objects.
@@ -4078,6 +4145,7 @@ async function loadTflSourcesFromOpenData() {
       const rawId = String(place?.id || '').replace(/^JamCams_/, '');
       if (!rawId) continue;
       const cameraId = `tfl-${rawId}`;
+      const videoUrl = officialTflVideoUrl(props.videoUrl);
 
       cameras.push({
         id: cameraId,
@@ -4096,9 +4164,11 @@ async function loadTflSourcesFromOpenData() {
         rangeM: 145,
         mountHeightM: 8,
         groundElevationM: 15, // Thames-basin prior; one-shot snap corrects.
-        feedType: 'image', // stills-first (owner decision); props.videoUrl deliberately unused
+        feedType: 'image', // ambient cards stay stills; focused plane can play videoUrl
         url: imageUrl,
         snapshotUrl: imageUrl,
+        videoUrl,
+        videoFeedType: videoUrl ? 'mp4' : '',
         sourceKind: 'tfl-open-data',
         license: 'Powered by TfL Open Data',
       });
@@ -4140,6 +4210,12 @@ function normalizeSourceItem(item) {
     feedType: normalizeFeedType(item.feedType || item.type || ''),
     url: typeof item.url === 'string' ? item.url : '',
     snapshotUrl: typeof item.snapshotUrl === 'string' ? item.snapshotUrl : '',
+    videoUrl: typeof item.videoUrl === 'string' ? item.videoUrl.trim() : '',
+    videoFeedType: (() => {
+      const declared = normalizeFeedType(item.videoFeedType || item.video_feed_type || '');
+      if (isVideoFeedType(declared)) return declared;
+      return inferVideoFeedTypeFromUrl(item.videoUrl || item.video_url || '');
+    })(),
     license: String(item.license || item.licenseNote || ''),
     sourceKind: String(item.sourceKind || item.kind || 'configured'),
     // Optional CAL badge input (cctv-v2 design §3b/§9.2, additive-only per the
@@ -4493,7 +4569,7 @@ function cctvProxy() {
 
   /** Build a JSON payload describing stream info (feedType, URLs) for a camera. */
   const buildStreamPayload = (source, cameraId) => {
-    const feedType = normalizeFeedType(source?.feedType || 'image');
+    const feedType = registeredFocusFeedType(source);
     return {
       id: cameraId,
       feedType,
@@ -4565,6 +4641,9 @@ function cctvProxy() {
                 mountHeightM: source.mountHeightM,
                 groundElevationM: source.groundElevationM,
                 feedType: normalizeFeedType(source.feedType),
+                videoFeedType: isVideoFeedType(normalizeFeedType(source.videoFeedType))
+                  ? normalizeFeedType(source.videoFeedType)
+                  : '',
                 sourceKind: source.sourceKind || (source.url ? 'configured' : 'fallback'),
                 poseSource: source.poseSource,
                 license: source.license,
@@ -4593,8 +4672,8 @@ function cctvProxy() {
           if (url.pathname.startsWith('/media/')) {
             const cameraId = decodeURIComponent(url.pathname.replace('/media/', '').trim()) || 'camera';
             const source = sourceById.get(cameraId);
-            const mediaUrl = source?.url || '';
-            const feedType = normalizeFeedType(source?.feedType || 'image');
+            const mediaUrl = registeredFocusMediaUrl(source);
+            const feedType = registeredFocusFeedType(source);
 
             if (!mediaUrl || !/^https?:\/\//i.test(mediaUrl)) {
               setHealth(cameraId, {

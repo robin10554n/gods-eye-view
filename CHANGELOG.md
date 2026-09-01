@@ -9,6 +9,9 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 - Globe pointer controls no longer use the middle mouse button. Scroll zooms;
   left-drag orbits; right-drag tilts; holding both buttons looks in place.
+- Opening a TfL JamCam plays that camera's public MP4 clip on the monitor
+  plane. Thumbnail cards stay stills. Austin and Caltrans still have no
+  public live video, so their focused planes remain JPEG refreshes.
 
 ### Fixed
 

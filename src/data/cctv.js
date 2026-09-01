@@ -20,7 +20,9 @@
  *   perpendicular to the view axis (static — never billboarded). Video feeds
  *   bind the HTMLVideoElement directly (Cesium updates video textures
  *   per-frame); image feeds alternate two offscreen canvases so the texture
- *   re-uploads on every repaint tick (<=1Hz). One live plane at a time. On
+ *   re-uploads on every repaint tick (<=1Hz). One live plane at a time. When
+ *   the catalog has a stills `feedType` plus a `videoFeedType` (TfL JamCam
+ *   MP4 clips), only this focused plane plays the clip. On
  *   activation a single scene.pickFromRay obstruction probe (§9.1 — the ONLY
  *   raycast in the subsystem) clamps the plane's range short of the first
  *   tile hit so the end cap never clips into buildings.
@@ -119,6 +121,7 @@ const ACTIVE_FRAME_REFRESH_MS = 10000;
 const IDLE_FRAME_REFRESH_MS = 60000;
 const PROJECTION_ACTIVE_REFRESH_MS = 10000;
 const PROJECTION_IDLE_REFRESH_MS = 60000;
+const PROJECTION_VIDEO_REFRESH_MS = 120000;
 const PROJECTION_CANVAS_WIDTH = 1920;
 const PROJECTION_CANVAS_HEIGHT = 1080;
 // Downsample grid for the unchanged-frame signature (drawProjectionFrame).
@@ -574,6 +577,20 @@ function normalizeFeedType(value) {
  */
 function isVideoFeedType(feedType) {
   return feedType === 'mp4' || feedType === 'hls' || feedType === 'webm';
+}
+
+/**
+ * Feed type for the one active monitor plane. Ambient cards keep `feedType`
+ * as stills; a separate `videoFeedType` can play on focus without dropping
+ * the thumbnail ring.
+ *
+ * @param {Object|null|undefined} camera
+ * @returns {string}
+ */
+export function projectionFeedType(camera) {
+  const videoType = normalizeFeedType(camera?.videoFeedType);
+  if (isVideoFeedType(videoType)) return videoType;
+  return normalizeFeedType(camera?.feedType);
 }
 
 /**
@@ -1052,6 +1069,7 @@ function seedCatalog() {
       provider: 'OSM Camera Grid',
       sourceKind: 'seed',
       feedType: 'image',
+      videoFeedType: '',
       feedConfigured: false,
       headingConfidence: 'medium',
       lat: poi.lat + latOffset,
@@ -1142,6 +1160,9 @@ function buildCatalogFromSources(rawSources) {
     const pitchDeg = clamp(safeNumber(source.pitchDeg, seed?.pitchDeg ?? -17), -55, -2);
     const groundElevationM = safeNumber(source.groundElevationM, city?.groundElevation ?? seed?.groundElevationM ?? 0);
     const feedType = normalizeFeedType(source.feedType || source.type || 'image');
+    const videoFeedType = isVideoFeedType(normalizeFeedType(source.videoFeedType))
+      ? normalizeFeedType(source.videoFeedType)
+      : '';
     const headingConfidence = String(source.headingConfidence || (seed ? 'high' : 'low')).toLowerCase();
     // CAL badge input (design §3b passthrough): hand-authored file/env source
     // entries may carry poseSource:'curated'. Austin Open Data rows never set
@@ -1156,6 +1177,7 @@ function buildCatalogFromSources(rawSources) {
       provider: String(source.provider || seed?.provider || 'Configured CCTV Source'),
       sourceKind: String(source.sourceKind || source.kind || (source.url ? 'configured' : 'seed')).toLowerCase(),
       feedType,
+      videoFeedType,
       feedConfigured: typeof source.url === 'string' && !!source.url.trim(),
       lat,
       lon,
@@ -1656,6 +1678,33 @@ export function _updateCctvProjectionPlaneForTest(record) {
 }
 
 /**
+ * TfL JamCam MP4s are short looping clips that TfL replaces on S3 every few
+ * minutes. Reloading the focused <video> src on this cadence picks up a newer
+ * object without interrupting playback every 15 seconds.
+ *
+ * @param {Object} runtime
+ * @param {Object} camera
+ */
+function scheduleProjectionVideoRefresh(runtime, camera) {
+  if (!runtime?.video) return;
+  if (runtime.videoRefreshTimer) return;
+  runtime.videoRefreshTimer = setInterval(() => {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    if (!runtime.video) return;
+    runtime.video.src = mediaUrlFor(camera);
+  }, PROJECTION_VIDEO_REFRESH_MS);
+}
+
+/**
+ * @param {Object|null|undefined} runtime
+ */
+function clearProjectionVideoRefresh(runtime) {
+  if (!runtime?.videoRefreshTimer) return;
+  clearInterval(runtime.videoRefreshTimer);
+  runtime.videoRefreshTimer = 0;
+}
+
+/**
  * Creates the projection runtime for a camera record: an offscreen canvas,
  * the monitor plane plus associated host label, and either an
  * <img> or <video> element depending on the feed type.
@@ -1675,7 +1724,7 @@ function createProjectionRuntime(record) {
   canvas.height = PROJECTION_CANVAS_HEIGHT;
   const ctx = canvas.getContext('2d', { alpha: true });
 
-  const feedType = normalizeFeedType(record.camera.feedType);
+  const feedType = projectionFeedType(record.camera);
   const mode = isVideoFeedType(feedType) ? 'video' : 'image';
   const runtime = {
     mode,
@@ -1707,6 +1756,7 @@ function createProjectionRuntime(record) {
     // only re-uploads the plane texture when there is genuinely new content.
     canvasStamp: 1,
     lastSwappedCanvasStamp: 0,
+    videoRefreshTimer: 0,
   };
 
   paintProjectionPlaceholder(ctx, record.camera);
@@ -1724,6 +1774,7 @@ function createProjectionRuntime(record) {
       video.play().catch(() => {});
     });
     runtime.video = video;
+    scheduleProjectionVideoRefresh(runtime, record.camera);
   } else {
     const img = new Image();
     img.decoding = 'async';
@@ -1780,6 +1831,7 @@ function ensureProjectionRuntime(record) {
  */
 function destroyProjectionRuntime(runtime) {
   if (!runtime) return;
+  clearProjectionVideoRefresh(runtime);
   if (runtime.video) {
     runtime.video.pause();
     runtime.video.removeAttribute('src');
@@ -2627,8 +2679,10 @@ function pauseInactiveProjectionFeeds(activeId) {
     if (!record.projection?.video) continue;
     if (record.camera.id === activeId && _enabled && _showProjection) {
       record.projection.video.play().catch(() => {});
+      scheduleProjectionVideoRefresh(record.projection, record.camera);
     } else {
       record.projection.video.pause();
+      clearProjectionVideoRefresh(record.projection);
     }
   }
 }
@@ -3370,7 +3424,7 @@ function buildSummaryText() {
     `PROJ ${_showProjection ? 'MONITOR' : 'OFF'}`,
     _coverageMode === 'viewshed' ? 'VIEWSHED' : null,
     `CAL ${calBadge.replace('-', ' ').toUpperCase()}`,
-    health?.sourceKind ? `SRC ${String(health.sourceKind).toUpperCase()}` : `SRC ${String(active.camera.feedType || 'image').toUpperCase()}`,
+    health?.sourceKind ? `SRC ${String(health.sourceKind).toUpperCase()}` : `SRC ${String(projectionFeedType(active.camera) || 'image').toUpperCase()}`,
     `${viewBand.toUpperCase()} CONTEXT`,
   ].filter(Boolean).join(' · ');
 }
@@ -3402,7 +3456,7 @@ function getPublicCameraState(record, activeId = null) {
     elevationM: camera.absoluteHeightM,
     mountHeightM: camera.mountHeightM,
     active: isActive,
-    feedType: camera.feedType,
+    feedType: isActive ? projectionFeedType(camera) : camera.feedType,
     sourceKind: health?.sourceKind || camera.sourceKind || (camera.feedConfigured ? 'configured' : 'seed'),
     sourceStatus: health?.status || 'unknown',
     sourceMessage: health?.message || '',
