@@ -3974,7 +3974,7 @@ async function loadAustinSourcesFromOpenData() {
         headingDeg,
         headingConfidence: hasHeading ? 'high' : 'low',
         pitchDeg: hasHeading ? -24 : -18,
-        fovDeg: hasHeading ? 56 : 44,
+        fovDeg: 72,
         rangeM: hasHeading ? 210 : 145,
         mountHeightM: hasHeading ? 10 : 8,
         groundElevationM: 150,
@@ -4074,7 +4074,7 @@ async function loadCaltransSourcesFromOpenData() {
         // RAW PRIOR starting points; the client's one-shot ground snap + manual
         // calibration own the truth.
         pitchDeg: hasHeading ? -24 : -18,
-        fovDeg: hasHeading ? 56 : 44,
+        fovDeg: 72,
         rangeM: hasHeading ? 210 : 145,
         mountHeightM: hasHeading ? 10 : 8,
         // loc.elevation is reported in FEET (verified: D3 maxes at 7427 ft ≈
@@ -4160,7 +4160,7 @@ async function loadTflSourcesFromOpenData() {
         headingDeg: fallbackHeadingFromId(cameraId),
         headingConfidence: 'low',
         pitchDeg: -18,
-        fovDeg: 44,
+        fovDeg: 72,
         rangeM: 145,
         mountHeightM: 8,
         groundElevationM: 15, // Thames-basin prior; one-shot snap corrects.
@@ -4457,6 +4457,10 @@ async function proxyMediaResponse(res, upstream, { sourceHeader = 'upstream' } =
   if (contentLength) headers['Content-Length'] = contentLength;
   if (contentRange) headers['Content-Range'] = contentRange;
   if (acceptRanges) headers['Accept-Ranges'] = acceptRanges;
+  const lastModified = upstream.headers.get('last-modified');
+  const etag = upstream.headers.get('etag');
+  if (lastModified) headers['Last-Modified'] = lastModified;
+  if (etag) headers['ETag'] = etag;
 
   // Cheap defense: reject an upstream that DECLARES an oversized fixed body.
   // Live MJPEG/HLS streams are unbounded by design and send no content-length,

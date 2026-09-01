@@ -39,6 +39,7 @@ import cctvLayer, {
   FRUSTUM_GROUND_CLEARANCE_M,
   MONITOR_PLANE_RENDER_STATE,
   monitorPlaneModelMatrix,
+  frustumWireframeLinePositions,
   CCTV_CALIBRATION_STORAGE_KEY_V2,
   CCTV_CALIBRATION_STORAGE_KEY_V1,
   readCalibrationStoreV2,
@@ -600,6 +601,9 @@ test('focused monitor plane fill does not depth-test against the city', () => {
   const src = fs.readFileSync(fileURLToPath(new URL('./cctv.js', import.meta.url)), 'utf8');
   assert.match(src, /depthTest: \{ enabled: MONITOR_PLANE_RENDER_STATE\.depthTest\.enabled \}/);
   assert.match(src, /runtime\.planeEntity\.plane\.fill = false/);
+  assert.match(src, /syncFrustumWireframePrimitive\(runtime, positions\)/);
+  assert.match(src, /new Cesium\.PolylineGeometry\(/);
+  assert.match(src, /focusedPrimitiveRenderState\(\)/);
 });
 
 test('monitor plane model matrix sits the unit quad on the frustum cap', () => {
@@ -663,6 +667,75 @@ test('focused monitor plane primitive tracks visibility and cap placement', () =
     hideCctvRecordVisuals([record], () => {}, record.camera.id);
     assert.equal(runtime.planeEntity.show, false);
     assert.equal(runtime.planePrimitive.show, false);
+  } finally {
+    _setCctvCoverageStateForTest({ enabled: false });
+    _setCctvOverlayHostForTest();
+  }
+});
+
+test('focused frustum overlay rays weld to the monitor corners', () => {
+  const geometry = computeFrustumGeometry(UNCLAMPED_CAMERA, UNCLAMPED_GROUND);
+  const positions = {
+    mount: Cesium.Cartesian3.fromDegrees(geometry.mount.lon, geometry.mount.lat, geometry.mount.alt),
+    tl: Cesium.Cartesian3.fromDegrees(geometry.corners.tl.lon, geometry.corners.tl.lat, geometry.corners.tl.alt),
+    tr: Cesium.Cartesian3.fromDegrees(geometry.corners.tr.lon, geometry.corners.tr.lat, geometry.corners.tr.alt),
+    br: Cesium.Cartesian3.fromDegrees(geometry.corners.br.lon, geometry.corners.br.lat, geometry.corners.br.alt),
+    bl: Cesium.Cartesian3.fromDegrees(geometry.corners.bl.lon, geometry.corners.bl.lat, geometry.corners.bl.alt),
+  };
+  const lines = frustumWireframeLinePositions(positions);
+  assert.equal(lines.length, 5);
+  assert.deepEqual(lines[0], [positions.mount, positions.tl]);
+  assert.deepEqual(lines[1], [positions.mount, positions.tr]);
+  assert.deepEqual(lines[2], [positions.mount, positions.br]);
+  assert.deepEqual(lines[3], [positions.mount, positions.bl]);
+  assert.deepEqual(lines[4], [
+    positions.tl, positions.tr, positions.br, positions.bl, positions.tl,
+  ]);
+});
+
+test('focused frustum overlay hides entity polylines and follows the plane', () => {
+  const overlayHost = {
+    setEntries() {},
+    setVisible() {},
+    clearSource() {},
+  };
+  const viewer = { entities: new Cesium.EntityCollection() };
+  const coverageEntities = [
+    { show: false, polyline: { positions: [] } },
+    { show: false, polyline: { positions: [] } },
+    { show: false, polyline: { positions: [] } },
+    { show: false, polyline: { positions: [] } },
+    { show: false, polyline: { positions: [] }, _coverageRole: 'cap' },
+  ];
+  const record = {
+    camera: {
+      ...UNCLAMPED_CAMERA,
+      id: 'overlay-cone',
+      name: 'Overlay Cone',
+      groundElevationM: UNCLAMPED_GROUND,
+    },
+    coverageEntities,
+    projection: null,
+  };
+  _setCctvOverlayHostForTest(overlayHost);
+  try {
+    const runtime = _createCctvProjectionPlaneForTest(viewer, record);
+    runtime.wireframePrimitive = { show: false };
+    record.projection = runtime;
+    _setCctvCoverageStateForTest({
+      viewer,
+      records: [record],
+      activeCameraId: record.camera.id,
+      enabled: true,
+      coverageMode: 'off',
+      showProjection: true,
+    });
+    refreshCoverageStyles();
+    assert.equal(runtime.wireframePrimitive.show, true);
+    assert.ok(coverageEntities.every((entity) => entity.show === false));
+
+    hideCctvRecordVisuals([record], () => {}, record.camera.id);
+    assert.equal(runtime.wireframePrimitive.show, false);
   } finally {
     _setCctvCoverageStateForTest({ enabled: false });
     _setCctvOverlayHostForTest();

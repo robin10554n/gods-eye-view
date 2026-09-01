@@ -7,7 +7,7 @@ import {
   registeredFocusFeedType,
   registeredFocusMediaUrl,
 } from '../../vite.config.js';
-import { projectionFeedType } from './cctv.js';
+import { projectionFeedType, isHybridFocusClip } from './cctv.js';
 
 const TFL_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
 const TFL_MP4 = `${TFL_ORIGIN}JamCams/00001.0123.mp4`;
@@ -66,6 +66,7 @@ test('TfL catalog keeps stills for cards and pins official MP4s for the focused 
   assert.match(viteSrc, /videoUrl: officialTflVideoUrl\(props\.videoUrl\)|const videoUrl = officialTflVideoUrl\(props\.videoUrl\)/);
   assert.match(viteSrc, /videoFeedType: videoUrl \? 'mp4' : ''/);
   assert.match(viteSrc, /videoFeedType: isVideoFeedType\(normalizeFeedType\(source\.videoFeedType\)\)/);
+  assert.match(viteSrc, /fovDeg: 72/);
   assert.doesNotMatch(
     viteSrc.slice(viteSrc.indexOf("if (url.pathname === '/sources')"), viteSrc.indexOf("if (url.pathname === '/health')")),
     /videoUrl: source/,
@@ -73,4 +74,13 @@ test('TfL catalog keeps stills for cards and pins official MP4s for the focused 
 
   assert.match(cctvSrc, /const feedType = projectionFeedType\(record\.camera\)/);
   assert.match(cctvSrc, /isVideo: isVideoFeedType\(normalizeFeedType\(record\.camera\.feedType\)\)/);
+  assert.match(cctvSrc, /video\.loop = !hybridClip/);
+  assert.match(cctvSrc, /void snapActiveCameraToRoad\(record\)/);
+  assert.match(cctvSrc, /clamp\(safeNumber\(source\.rangeM, seed\?\.rangeM \?\? 700\), 120, 2200\)/);
+});
+
+test('TfL stills-plus-clip cameras are hybrid focus feeds, demo mp4 catalogs are not', () => {
+  assert.equal(isHybridFocusClip({ feedType: 'image', videoFeedType: 'mp4' }), true);
+  assert.equal(isHybridFocusClip({ feedType: 'mp4' }), false);
+  assert.equal(isHybridFocusClip({ feedType: 'image' }), false);
 });

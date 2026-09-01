@@ -1929,7 +1929,11 @@ silently demoting every later lookup for the session.
   frustum wireframe (4 corner rays + far-cap rectangle) with a monitor plane at the frustum's
   far cap, retargeting the existing video/canvas texture pipeline. The focused fill draws
   without a depth test so photoreal tiles cannot bury the frame in a building or the ground;
-  the native plane entity keeps the outline and pick target. Manual calibration only —
+  the focused frustum's 4 corner rays use the same depth-free pass after the fill so the
+  cone stays welded to the monitor corners. The native plane entity keeps the outline and pick target. Low-confidence headings
+  snap to the nearest OSM road on activation, picking the direction with more free
+  space so cones do not aim into facades. TfL focused video plays the newest public
+  recap clip once, then follows the JPEG until a new MP4 appears. Manual calibration only —
   auto-calibration and the drape mesh pipeline are deleted. A one-shot activation obstruction
   probe (`pickFromRay` on camera activation, clamping the plane short of the first hit) remains;
   ground placement is superseded by the shared-floor v3 behavior below. Calibration persists to
@@ -1952,9 +1956,10 @@ silently demoting every later lookup for the session.
   1,003 rows). City packs (2026-07-04): Caltrans (districts 4/7/11/3 — SF, LA, San Diego,
   Sacramento; cap 300) and TfL London JamCams (cap 250) join Austin (cap 250) as keyless default
   sources — ~800 cameras total, all RAW PRIOR poses. Ambient cards are stills.
-  The focused monitor plane plays TfL's official looping MP4 clip when present;
+  The focused monitor plane plays TfL's newest recap clip once, then follows
+  the JPEG until TfL publishes a new MP4. Ambient cards are stills.
   Austin and Caltrans publish JPEGs only, so those focused planes stay on the
-  10-second still refresh.
+  10-second still refresh. Live-pack FOV priors are 72°.
 - **CCTV v3 UX — viewshed + calibration gizmo** (built 2026-07-05 and field
   validated 2026-07-21): the COVERAGE toggle is a
   tri-state cycle `OFF → ON → VIEWSHED`; viewshed mode renders each visible camera's frustum

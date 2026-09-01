@@ -22,12 +22,14 @@
  *   per-frame); image feeds alternate two offscreen canvases so the texture
  *   re-uploads on every repaint tick (<=1Hz). One live plane at a time. When
  *   the catalog has a stills `feedType` plus a `videoFeedType` (TfL JamCam
- *   MP4 clips), only this focused plane plays the clip. The focused fill is
+ *   recap clips), the focused plane plays the newest clip once, then follows
+ *   the JPEG until TfL publishes a new MP4. Guessed headings snap to the
+ *   nearest OSM road on activation. The focused fill is
  *   drawn without a depth test so photoreal tiles cannot bury it in a
- *   building or the ground; the frustum wireframe still uses depth-fail
- *   so the cone reads through the city. On
- *   activation a single scene.pickFromRay obstruction probe (§9.1 — the ONLY
- *   raycast in the subsystem) clamps the plane's range short of the first
+ *   building or the ground; the focused frustum wireframe (4 corner rays +
+ *   far-cap rectangle) uses the same depth-free pass so the cone is not
+ *   painted over by the feed. On
+ *   activation pickFromRay probes clamp the plane's range short of the first
  *   tile hit so the end cap never clips into buildings.
  *
  * - Ambient card tier (2026-07-29 design): the LOD-selected nearby static
@@ -104,6 +106,12 @@ import {
   onFocusTargetAppear,
 } from './focusDeemphasis.js';
 import { holdContinuousRender, releaseContinuousRender } from '../renderGovernor.js';
+import {
+  chooseClearerHeading,
+  fetchNearbyRoadElements,
+  nearestRoadHeadingDeg,
+  shouldSnapRoadHeading,
+} from './cctvRoadHeading.js';
 
 // ---------------------------------------------------------------------------
 // API endpoints
@@ -125,6 +133,8 @@ const IDLE_FRAME_REFRESH_MS = 60000;
 const PROJECTION_ACTIVE_REFRESH_MS = 10000;
 const PROJECTION_IDLE_REFRESH_MS = 60000;
 const PROJECTION_VIDEO_REFRESH_MS = 120000;
+const HYBRID_CLIP_RETRY_MS = 20000;
+const PROJECTION_SNAPSHOT_REFRESH_MS = 5000;
 const PROJECTION_CANVAS_WIDTH = 1920;
 const PROJECTION_CANVAS_HEIGHT = 1080;
 // Downsample grid for the unchanged-frame signature (drawProjectionFrame).
@@ -163,8 +173,9 @@ const PROJECTION_VERT_ASPECT = PROJECTION_CANVAS_WIDTH / PROJECTION_CANVAS_HEIGH
 // the monitor plane in the 3D tiles. Exported for the unit suite.
 export const FRUSTUM_GROUND_CLEARANCE_M = 2;
 /**
- * Focused monitor-plane fill ignores scene depth so 3D tiles cannot occlude
- * the live frame. The native entity keeps the outline and pick target.
+ * Focused monitor fill and camera-to-corner rays ignore scene depth so 3D
+ * tiles cannot occlude them, and so the feed quad cannot paint over the cone.
+ * The native entity keeps the outline and pick target.
  */
 export const MONITOR_PLANE_RENDER_STATE = Object.freeze({
   depthTest: Object.freeze({ enabled: false }),
@@ -602,6 +613,12 @@ export function projectionFeedType(camera) {
   const videoType = normalizeFeedType(camera?.videoFeedType);
   if (isVideoFeedType(videoType)) return videoType;
   return normalizeFeedType(camera?.feedType);
+}
+
+/** TfL-style stills plus a recap MP4: play the clip once, then follow the JPEG. */
+export function isHybridFocusClip(camera) {
+  return isVideoFeedType(projectionFeedType(camera))
+    && !isVideoFeedType(normalizeFeedType(camera?.feedType));
 }
 
 /**
@@ -1166,7 +1183,7 @@ function buildCatalogFromSources(rawSources) {
         : (seed?.headingDeg ?? headingFromId(id))
     );
     const fovDeg = clamp(safeNumber(source.fovDeg, seed?.fovDeg ?? 74), 20, 125);
-    const rangeM = clamp(safeNumber(source.rangeM, seed?.rangeM ?? 700), 220, 2200);
+    const rangeM = clamp(safeNumber(source.rangeM, seed?.rangeM ?? 700), 120, 2200);
     const mountHeightM = clamp(safeNumber(source.mountHeightM, seed?.mountHeightM ?? 24), 6, 120);
     const pitchDeg = clamp(safeNumber(source.pitchDeg, seed?.pitchDeg ?? -17), -55, -2);
     const groundElevationM = safeNumber(source.groundElevationM, city?.groundElevation ?? seed?.groundElevationM ?? 0);
@@ -1270,6 +1287,25 @@ function frustumCartesians(geometry) {
       geometry.topCenter.alt + 1.2
     ),
   };
+}
+
+/**
+ * Five polylines that draw the pitched frustum: 4 mount→corner rays plus the
+ * closed far-cap rectangle. Shared by the entity wireframe and the focused
+ * depth-test-free overlay so both stay welded to the monitor corners.
+ *
+ * @param {{mount: Cesium.Cartesian3, tl: Cesium.Cartesian3, tr: Cesium.Cartesian3,
+ *   br: Cesium.Cartesian3, bl: Cesium.Cartesian3}} positions
+ * @returns {Cesium.Cartesian3[][]}
+ */
+export function frustumWireframeLinePositions(positions) {
+  return [
+    [positions.mount, positions.tl],
+    [positions.mount, positions.tr],
+    [positions.mount, positions.br],
+    [positions.mount, positions.bl],
+    [positions.tl, positions.tr, positions.br, positions.bl, positions.tl],
+  ];
 }
 
 /**
@@ -1497,7 +1533,8 @@ function paintNextProjectionBuffer(runtime) {
  */
 function refreshProjectionTextures(record) {
   const runtime = record?.projection;
-  if (!runtime || runtime.mode === 'video') return;
+  if (!runtime) return;
+  if (runtime.mode === 'video' && !runtime.showingSnapshot) return;
   const now = Date.now();
   if (now - safeNumber(runtime.lastTextureSwapAt, 0) < PROJECTION_TEXTURE_SWAP_MS) return;
 
@@ -1547,7 +1584,7 @@ function frameUrlFor(camera, refreshMs = ACTIVE_FRAME_REFRESH_MS) {
  * @returns {string} Media URL.
  */
 function mediaUrlFor(camera) {
-  return `${MEDIA_ENDPOINT}/${encodeURIComponent(camera.id)}?ts=${Math.floor(Date.now() / 15000)}`;
+  return `${MEDIA_ENDPOINT}/${encodeURIComponent(camera.id)}?ts=${Date.now()}`;
 }
 
 /**
@@ -1610,6 +1647,7 @@ function updatePlanePlacement(record) {
     );
   }
   syncMonitorPlanePrimitive(record, runtime, geometry, positions);
+  syncFrustumWireframePrimitive(runtime, positions);
   if (runtime.labelPosition) {
     Cesium.Cartesian3.clone(positions.label, runtime.labelPosition);
   }
@@ -1634,6 +1672,7 @@ function setPlaneVisible(runtime, visible) {
   const showing = !!visible;
   if (runtime.planeEntity) runtime.planeEntity.show = showing;
   if (runtime.planePrimitive) runtime.planePrimitive.show = showing;
+  if (runtime.wireframePrimitive) runtime.wireframePrimitive.show = showing;
   if (visible && runtime.overlayEntry && runtime.cameraId) {
     if (_projectionOverlayOwnerId !== runtime.cameraId) {
       _cctvOverlayHost.setEntries(
@@ -1674,6 +1713,7 @@ function createProjectionPlane(record, runtime, geometry, positions) {
     },
   });
   syncMonitorPlanePrimitive(record, runtime, geometry, positions);
+  syncFrustumWireframePrimitive(runtime, positions);
   return runtime.planeEntity;
 }
 
@@ -1689,14 +1729,80 @@ function setMonitorPlaneImage(runtime, image) {
   if (uniforms) uniforms.image = image;
 }
 
-function destroyMonitorPlanePrimitive(runtime) {
-  const primitive = runtime?.planePrimitive;
+function destroyScenePrimitive(runtime, key) {
+  const primitive = runtime?.[key];
   if (!primitive) return;
   const primitives = _viewer?.scene?.primitives;
   if (primitives && typeof primitives.remove === 'function') {
     primitives.remove(primitive);
   }
-  runtime.planePrimitive = null;
+  runtime[key] = null;
+}
+
+function destroyMonitorPlanePrimitive(runtime) {
+  destroyScenePrimitive(runtime, 'planePrimitive');
+}
+
+function destroyFrustumWireframePrimitive(runtime) {
+  destroyScenePrimitive(runtime, 'wireframePrimitive');
+}
+
+function focusedPrimitiveRenderState() {
+  return {
+    depthTest: { enabled: MONITOR_PLANE_RENDER_STATE.depthTest.enabled },
+    depthMask: MONITOR_PLANE_RENDER_STATE.depthMask,
+  };
+}
+
+/**
+ * Depth-test-free camera-to-corner rays, added after the monitor fill so the
+ * focused cone is not covered by the feed quad or photoreal tiles.
+ *
+ * @param {Object} runtime
+ * @param {Object} positions
+ */
+function syncFrustumWireframePrimitive(runtime, positions) {
+  if (!runtime || !positions?.mount) return;
+  const primitives = _viewer?.scene?.primitives;
+  if (!primitives || typeof primitives.add !== 'function') return;
+
+  const showing = runtime.wireframePrimitive
+    ? !!runtime.wireframePrimitive.show
+    : !!runtime.planeEntity?.show;
+  const lines = frustumWireframeLinePositions(positions);
+  destroyFrustumWireframePrimitive(runtime);
+
+  try {
+    const instances = lines.map((linePositions, index) => new Cesium.GeometryInstance({
+      geometry: new Cesium.PolylineGeometry({
+        positions: linePositions,
+        width: index === 4 ? 2.2 : 1.8,
+        vertexFormat: Cesium.PolylineColorAppearance.VERTEX_FORMAT,
+        arcType: Cesium.ArcType.NONE,
+      }),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+          index === 4 ? ACTIVE_COVERAGE_CENTER : ACTIVE_COVERAGE_EDGE,
+        ),
+      },
+    }));
+    const primitive = new Cesium.Primitive({
+      geometryInstances: instances,
+      appearance: new Cesium.PolylineColorAppearance({
+        translucent: true,
+        renderState: focusedPrimitiveRenderState(),
+      }),
+      asynchronous: false,
+      allowPicking: false,
+      show: showing,
+    });
+    runtime.wireframePrimitive = primitives.add(primitive);
+    if (typeof primitives.raiseToTop === 'function') {
+      primitives.raiseToTop(runtime.wireframePrimitive);
+    }
+  } catch {
+    runtime.wireframePrimitive = null;
+  }
 }
 
 /**
@@ -1744,8 +1850,7 @@ function syncMonitorPlanePrimitive(record, runtime, geometry, positions) {
         flat: true,
         faceForward: true,
         renderState: {
-          depthTest: { enabled: MONITOR_PLANE_RENDER_STATE.depthTest.enabled },
-          depthMask: MONITOR_PLANE_RENDER_STATE.depthMask,
+          ...focusedPrimitiveRenderState(),
           blending: Cesium.BlendingState.ALPHA_BLEND,
           cull: { enabled: false },
         },
@@ -1778,6 +1883,7 @@ export function _createCctvProjectionPlaneForTest(viewer, record) {
     cameraId: String(record.camera.id),
     planeEntity: null,
     planePrimitive: null,
+    wireframePrimitive: null,
     labelPosition: new Cesium.Cartesian3(),
     overlayEntry: null,
     planeMaterial: new Cesium.ColorMaterialProperty(Cesium.Color.WHITE),
@@ -1805,6 +1911,7 @@ export function _updateCctvProjectionPlaneForTest(record) {
  */
 function scheduleProjectionVideoRefresh(runtime, camera) {
   if (!runtime?.video) return;
+  if (runtime.hybridClip) return;
   if (runtime.videoRefreshTimer) return;
   runtime.videoRefreshTimer = setInterval(() => {
     if (typeof document !== 'undefined' && document.hidden) return;
@@ -1817,9 +1924,66 @@ function scheduleProjectionVideoRefresh(runtime, camera) {
  * @param {Object|null|undefined} runtime
  */
 function clearProjectionVideoRefresh(runtime) {
-  if (!runtime?.videoRefreshTimer) return;
-  clearInterval(runtime.videoRefreshTimer);
-  runtime.videoRefreshTimer = 0;
+  if (runtime?.videoRefreshTimer) {
+    clearInterval(runtime.videoRefreshTimer);
+    runtime.videoRefreshTimer = 0;
+  }
+  if (runtime?.clipRetryTimer) {
+    clearInterval(runtime.clipRetryTimer);
+    runtime.clipRetryTimer = 0;
+  }
+}
+
+function bindMonitorPlaneSource(runtime, source) {
+  if (!runtime || !source) return;
+  if (runtime.planeMaterial) runtime.planeMaterial.image = source;
+  setMonitorPlaneImage(runtime, source);
+}
+
+async function readClipIdentity(url) {
+  try {
+    const response = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+    if (!response.ok && response.status !== 206) return '';
+    return response.headers.get('etag')
+      || response.headers.get('last-modified')
+      || response.headers.get('content-length')
+      || '';
+  } catch {
+    return '';
+  }
+}
+
+function showHybridSnapshot(runtime, record) {
+  if (!runtime) return;
+  runtime.showingSnapshot = true;
+  bindMonitorPlaneSource(runtime, runtime.canvas);
+  if (record) refreshProjectionImage(record, true);
+}
+
+function showHybridVideo(runtime) {
+  if (!runtime?.video) return;
+  runtime.showingSnapshot = false;
+  bindMonitorPlaneSource(runtime, runtime.video);
+}
+
+function startHybridClipFollow(runtime, record) {
+  if (!runtime?.hybridClip || runtime.clipRetryTimer) return;
+  runtime.clipRetryTimer = setInterval(() => {
+    void tryFreshHybridClip(runtime, record);
+  }, HYBRID_CLIP_RETRY_MS);
+}
+
+async function tryFreshHybridClip(runtime, record) {
+  if (!runtime?.hybridClip || !runtime.video || !record) return;
+  if (getActiveRecord() !== record) return;
+  if (typeof document !== 'undefined' && document.hidden) return;
+  const url = mediaUrlFor(record.camera);
+  const identity = await readClipIdentity(url);
+  if (!identity || identity === runtime.clipId) return;
+  runtime.clipId = identity;
+  runtime.video.src = url;
+  showHybridVideo(runtime);
+  runtime.video.play().catch(() => {});
 }
 
 /**
@@ -1852,6 +2016,7 @@ function createProjectionRuntime(record) {
     video: null,
     planeEntity: null,
     planePrimitive: null,
+    wireframePrimitive: null,
     cameraId: String(record.camera.id),
     labelPosition: new Cesium.Cartesian3(),
     overlayEntry: null,
@@ -1876,14 +2041,20 @@ function createProjectionRuntime(record) {
     canvasStamp: 1,
     lastSwappedCanvasStamp: 0,
     videoRefreshTimer: 0,
+    clipRetryTimer: 0,
+    clipId: '',
+    hybridClip: false,
+    showingSnapshot: false,
   };
 
   paintProjectionPlaceholder(ctx, record.camera);
 
   if (mode === 'video') {
+    const hybridClip = isHybridFocusClip(record.camera);
+    runtime.hybridClip = hybridClip;
     const video = document.createElement('video');
     video.muted = true;
-    video.loop = true;
+    video.loop = !hybridClip;
     video.autoplay = true;
     video.playsInline = true;
     video.crossOrigin = 'anonymous';
@@ -1892,6 +2063,32 @@ function createProjectionRuntime(record) {
     video.addEventListener('canplay', () => {
       video.play().catch(() => {});
     });
+    if (hybridClip) {
+      const img = new Image();
+      img.decoding = 'async';
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        runtime.imageLoading = false;
+        runtime.imageReady = true;
+        runtime.imageStamp = Date.now();
+      };
+      img.onerror = () => {
+        runtime.imageLoading = false;
+        runtime.imageReady = false;
+      };
+      runtime.image = img;
+      video.addEventListener('ended', () => {
+        showHybridSnapshot(runtime, record);
+        startHybridClipFollow(runtime, record);
+      });
+      video.addEventListener('error', () => {
+        showHybridSnapshot(runtime, record);
+        startHybridClipFollow(runtime, record);
+      });
+      void readClipIdentity(video.src).then((identity) => {
+        if (identity) runtime.clipId = identity;
+      });
+    }
     runtime.video = video;
     scheduleProjectionVideoRefresh(runtime, record.camera);
   } else {
@@ -1961,6 +2158,7 @@ function destroyProjectionRuntime(runtime) {
     runtime.planeEntity = null;
   }
   destroyMonitorPlanePrimitive(runtime);
+  destroyFrustumWireframePrimitive(runtime);
   if (_projectionOverlayOwnerId === runtime.cameraId) clearProjectionOverlay();
   runtime.overlayEntry = null;
   runtime.labelPosition = null;
@@ -1975,7 +2173,8 @@ function destroyProjectionRuntime(runtime) {
  */
 function refreshProjectionImage(record, force = false) {
   const runtime = record?.projection;
-  if (!runtime || runtime.mode !== 'image' || !runtime.image) return;
+  if (!runtime || !runtime.image) return;
+  if (runtime.mode === 'video' && !runtime.showingSnapshot) return;
   // Hidden-state gate (perf wave 2): no new frame fetch/decode for a canvas
   // nobody can see. The refresh interval re-fills naturally on return.
   if (typeof document !== 'undefined' && document.hidden && !force) return;
@@ -1985,9 +2184,11 @@ function refreshProjectionImage(record, force = false) {
   // clears this latch so the next normal tick can refresh.
   if (runtime.imageLoading) return;
   const now = Date.now();
-  const refreshMs = record.camera.id === _activeCameraId
-    ? PROJECTION_ACTIVE_REFRESH_MS
-    : PROJECTION_IDLE_REFRESH_MS;
+  const refreshMs = runtime.showingSnapshot
+    ? PROJECTION_SNAPSHOT_REFRESH_MS
+    : record.camera.id === _activeCameraId
+      ? PROJECTION_ACTIVE_REFRESH_MS
+      : PROJECTION_IDLE_REFRESH_MS;
   if (!force && now - runtime.lastImageRefreshAt < refreshMs) return;
   runtime.lastImageRefreshAt = now;
 
@@ -2033,7 +2234,7 @@ function drawProjectionFrame(record) {
 
   const health = _healthById.get(record.camera.id) || null;
 
-  if (runtime.mode === 'video' && runtime.video) {
+  if (runtime.mode === 'video' && runtime.video && !runtime.showingSnapshot) {
     const video = runtime.video;
     if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
       runtime.ctx.clearRect(0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);
@@ -2243,13 +2444,10 @@ function applyFrustumGeometry(record, groundAltM) {
     record.billboard.position = positions.mount;
   }
   if (record.coverageEntities?.length >= 5) {
-    record.coverageEntities[0].polyline.positions = [positions.mount, positions.tl];
-    record.coverageEntities[1].polyline.positions = [positions.mount, positions.tr];
-    record.coverageEntities[2].polyline.positions = [positions.mount, positions.br];
-    record.coverageEntities[3].polyline.positions = [positions.mount, positions.bl];
-    record.coverageEntities[4].polyline.positions = [
-      positions.tl, positions.tr, positions.br, positions.bl, positions.tl,
-    ];
+    const lines = frustumWireframeLinePositions(positions);
+    for (let i = 0; i < 5; i += 1) {
+      record.coverageEntities[i].polyline.positions = lines[i];
+    }
   }
   // A live viewshed volume tracks its wireframe: rebuild from the SAME fresh
   // positions (weld invariant). Only records currently showing a volume pay
@@ -2315,6 +2513,7 @@ function updateRecordGeometry(record, options = {}) {
     if (record.billboard) excludeObjects.push(record.billboard);
     if (record.projection?.planeEntity) excludeObjects.push(record.projection.planeEntity);
     if (record.projection?.planePrimitive) excludeObjects.push(record.projection.planePrimitive);
+    if (record.projection?.wireframePrimitive) excludeObjects.push(record.projection.wireframePrimitive);
     sampleMeshFloorCells(_viewer?.scene, [point], {
       excludeObjects: excludeObjects.filter(Boolean),
       viewerLat: viewerCarto ? Cesium.Math.toDegrees(viewerCarto.latitude) : undefined,
@@ -2799,8 +2998,12 @@ function pauseInactiveProjectionFeeds(activeId) {
   for (const record of _records) {
     if (!record.projection?.video) continue;
     if (record.camera.id === activeId && _enabled && _showProjection) {
-      record.projection.video.play().catch(() => {});
-      scheduleProjectionVideoRefresh(record.projection, record.camera);
+      if (record.projection.showingSnapshot) {
+        startHybridClipFollow(record.projection, record);
+      } else {
+        record.projection.video.play().catch(() => {});
+        scheduleProjectionVideoRefresh(record.projection, record.camera);
+      }
     } else {
       record.projection.video.pause();
       clearProjectionVideoRefresh(record.projection);
@@ -3382,6 +3585,7 @@ export function hideCctvRecordVisuals(records, destroyVolume, activeCameraId = n
     if (record?.viewshedPrimitive) destroyVolume?.(record);
     if (record?.projection?.planeEntity) record.projection.planeEntity.show = false;
     if (record?.projection?.planePrimitive) record.projection.planePrimitive.show = false;
+    if (record?.projection?.wireframePrimitive) record.projection.wireframePrimitive.show = false;
   }
 }
 
@@ -3421,11 +3625,14 @@ export function refreshCoverageStyles() {
     const planeShowing = !!(_enabled && _showProjection && isActive);
 
     const inVisibleSet = coverageVisible.has(record.camera.id);
+    // Focused overlay rays replace the entity polylines so the depth-test-free
+    // feed cannot paint over the camera-to-corner cone.
+    const overlayCone = !!(planeShowing && record.projection?.wireframePrimitive);
     for (const entity of record.coverageEntities || []) {
       // The frustum wireframe is part of the projection representation —
       // force it on for the active camera and let it read through geometry
       // via depthFailMaterial (polylines have no disableDepthTestDistance).
-      entity.show = !!(_enabled && ((coverageOn && inVisibleSet) || planeShowing));
+      entity.show = !!(_enabled && !overlayCone && ((coverageOn && inVisibleSet) || planeShowing));
       if (!entity.polyline) continue;
       // Viewshed mode swaps the cyan/green scheme for the camera's own hue so
       // adjacent cones read as distinct coverage claims (design §3b); the
@@ -3768,43 +3975,99 @@ function ensureGizmo() {
 }
 
 /**
- * §9.1 activation obstruction probe (LOCKED owner decision): on camera
- * ACTIVATION only, fire ONE scene.pickFromRay along the frustum axis
- * (mount → cap-center direction). If it hits the tiles closer than the pose
- * range, clamp the plane's effective range just short of the first hit so the
- * "big and dramatic" true end cap never clips into downtown buildings.
+ * Objects the activation probes must ignore so they hit 3D tiles, not CCTV
+ * geometry.
+ * @returns {Array}
+ */
+function activationProbeExcludeList() {
+  const exclude = [_billboards, ..._coverageEntities];
+  for (const runtime of _projectionEntities) {
+    if (runtime?.planeEntity) exclude.push(runtime.planeEntity);
+    if (runtime?.planePrimitive) exclude.push(runtime.planePrimitive);
+    if (runtime?.wireframePrimitive) exclude.push(runtime.wireframePrimitive);
+  }
+  return exclude.filter(Boolean);
+}
+
+/**
+ * Distance along a heading from the mount to the first 3D-tile hit.
+ * Infinity means the ray did not hit — treat as an open street.
  *
- * This is the ONLY raycast in the whole CCTV subsystem — once per activation,
- * never per-frame (the zero-raycast invariant applies to steady state). The
- * per-camera range slider overrides the clamp: a user-set rangeScale skips the
- * probe entirely. Probe failure/miss keeps the unclamped range.
+ * @param {Object} record
+ * @param {number} headingDeg
+ * @returns {number}
+ */
+function probeHitDistanceM(record, headingDeg) {
+  const scene = _viewer?.scene;
+  if (!scene || typeof scene.pickFromRay !== 'function' || !record?.camera) return NaN;
+  try {
+    const camera = { ...record.camera, headingDeg };
+    const mountAlt = groundAltFor(record) + camera.mountHeightM;
+    const mountPos = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, mountAlt);
+    const { dir } = frustumFrameEcef(camera, mountPos);
+    const hit = scene.pickFromRay(new Cesium.Ray(mountPos, dir), activationProbeExcludeList());
+    if (!hit?.position) return Infinity;
+    return Cesium.Cartesian3.distance(mountPos, hit.position);
+  } catch {
+    return NaN;
+  }
+}
+
+/**
+ * §9.1 activation obstruction probe: on camera ACTIVATION, fire pickFromRay
+ * along the frustum axis (mount → cap-center direction). If it hits the tiles
+ * closer than the pose range, clamp the plane's effective range just short of
+ * the first hit so the true end cap never clips into downtown buildings.
+ *
+ * Steady state stays zero-raycast. Road-heading snap may fire two extra
+ * activation probes to pick the unobstructed street direction.
  * @param {Object} record - Camera record being activated.
  */
 function runActivationObstructionProbe(record) {
   record.probeClampRangeM = null;
-  const scene = _viewer?.scene;
-  if (!scene || typeof scene.pickFromRay !== 'function') return;
+  if (!_viewer?.scene || typeof _viewer.scene.pickFromRay !== 'function') return;
   const camera = record.camera;
   const rangeScale = normalizeCalibration(camera.calibration).rangeScale;
   if (Math.abs(rangeScale - 1) > 0.0001) return; // slider overrides the clamp
-  try {
-    const mountAlt = groundAltFor(record) + camera.mountHeightM;
-    const mountPos = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, mountAlt);
-    const { dir } = frustumFrameEcef(camera, mountPos);
-    // Exclude everything the layer itself draws so the probe can only hit the
-    // world (3D tiles), not our own billboards/polylines/planes.
-    const exclude = [_billboards, ..._coverageEntities];
-    for (const runtime of _projectionEntities) {
-      if (runtime?.planeEntity) exclude.push(runtime.planeEntity);
-      if (runtime?.planePrimitive) exclude.push(runtime.planePrimitive);
-    }
-    const hit = scene.pickFromRay(new Cesium.Ray(mountPos, dir), exclude);
-    if (!hit?.position) return;
-    const dist = Cesium.Cartesian3.distance(mountPos, hit.position);
-    record.probeClampRangeM = activationProbeClampRange(camera.rangeM, dist);
-  } catch {
-    // probe failure → keep the unclamped range
-  }
+  const dist = probeHitDistanceM(record, camera.headingDeg);
+  if (!Number.isFinite(dist) || dist === Infinity) return;
+  record.probeClampRangeM = activationProbeClampRange(camera.rangeM, dist);
+}
+
+function applySnappedHeading(record, headingDeg) {
+  const camera = record?.camera;
+  if (!camera) return;
+  if (!camera.basePose) ensureCameraPose(camera);
+  camera.basePose.headingDeg = normalizeHeading(headingDeg);
+  camera.roadHeadingSnapped = true;
+  ensureCameraPose(camera);
+}
+
+async function snapActiveCameraToRoad(record) {
+  if (!shouldSnapRoadHeading(record?.camera)) return;
+  const generation = (record.roadSnapGeneration || 0) + 1;
+  record.roadSnapGeneration = generation;
+  const elements = await fetchNearbyRoadElements(record.camera.lat, record.camera.lon);
+  if (record.roadSnapGeneration !== generation) return;
+  if (getActiveRecord() !== record) return;
+  const bearing = nearestRoadHeadingDeg(record.camera.lat, record.camera.lon, elements);
+  if (!Number.isFinite(bearing)) return;
+  const opposite = normalizeHeading(bearing + 180);
+  const along = probeHitDistanceM(record, bearing);
+  const reverse = probeHitDistanceM(record, opposite);
+  const heading = chooseClearerHeading(
+    bearing,
+    opposite,
+    along,
+    reverse,
+    record.camera.headingDeg,
+  );
+  applySnappedHeading(record, heading);
+  runActivationObstructionProbe(record);
+  applyFrustumGeometry(record, groundAltFor(record));
+  refreshCoverageStyles();
+  _gizmo?.refresh();
+  notifyListeners();
 }
 
 /**
@@ -3925,6 +4188,7 @@ export function setActiveCamera(cameraId) {
   // ADJUST mode follows the active camera.
   _gizmo?.refresh();
   notifyListeners();
+  void snapActiveCameraToRoad(record);
   return CCTV_ACTIVATION_RESULT.ACTIVATED;
 }
 
@@ -4006,12 +4270,13 @@ function buildCoverageEntities(record) {
     },
   });
 
+  const lines = frustumWireframeLinePositions(positions);
   const entities = [
-    addPolyline('ray-tl', [positions.mount, positions.tl]),
-    addPolyline('ray-tr', [positions.mount, positions.tr]),
-    addPolyline('ray-br', [positions.mount, positions.br]),
-    addPolyline('ray-bl', [positions.mount, positions.bl]),
-    addPolyline('cap', [positions.tl, positions.tr, positions.br, positions.bl, positions.tl]),
+    addPolyline('ray-tl', lines[0]),
+    addPolyline('ray-tr', lines[1]),
+    addPolyline('ray-br', lines[2]),
+    addPolyline('ray-bl', lines[3]),
+    addPolyline('cap', lines[4]),
   ];
 
   entities[0]._coverageRole = 'edge';

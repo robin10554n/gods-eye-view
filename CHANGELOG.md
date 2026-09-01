@@ -12,11 +12,19 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 - Opening a TfL JamCam plays that camera's public MP4 clip on the monitor
   plane. Thumbnail cards stay stills. Austin and Caltrans still have no
   public live video, so their focused planes remain JPEG refreshes.
+- Guessed CCTV headings snap to the nearest OSM road on focus so frustums
+  point down the street instead of into buildings. Live-pack FOV priors are
+  a typical 72° traffic-cam angle, and short ranges are no longer stretched
+  to 220 m.
+- TfL focused video plays the newest recap clip once, then follows the live
+  JPEG until TfL publishes a new MP4. The public API has no 24/7 stream.
 
 ### Fixed
 
 - The focused CCTV monitor plane draws in front of photoreal tiles, so the
   live frame stays visible instead of clipping into buildings or the ground.
+  The four camera-to-corner rays use the same depth-free pass so the feed
+  cannot paint over the cone.
 - Pinokio now recognizes its nested successful-install marker, so a completed
   one-click install exposes Start instead of returning to Install.
 - The keyless `dev-fresh.sh` startup summary now names Esri World Imagery with
